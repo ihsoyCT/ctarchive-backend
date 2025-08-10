@@ -91,7 +91,6 @@ app.get('/reddit-comments', async (req, res) => {
         // Reddit returns an array, second element is comments
         const commentsTree = response.data[1]?.data?.children || [];
 
-        console.log(commentsTree);
         // Recursively collect all comment IDs
         function collectIds(comments) {
             let ids = [];
