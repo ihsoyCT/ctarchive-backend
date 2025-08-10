@@ -152,6 +152,7 @@ app.get('/reddit-comments', async (req, res) => {
             return res.status(429).send(error.message);
         }
         console.error('Error fetching Reddit comments:', error.message, " url: ", error.config?.url);
+        console.error(error)
         res.status(500).send('Failed to fetch comments');
     }
 });
