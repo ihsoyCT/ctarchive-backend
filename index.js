@@ -134,47 +134,95 @@ app.listen(port, '127.0.0.1', () => {
     console.log(`Server running at http://localhost:${port}`);
 });
 
-// New endpoint: get comment IDs from a Reddit post
-app.get('/reddit-comments', async (req, res) => {
-    const postParam = req.query.post;
-    if (!postParam) {
-        return res.status(400).send('Missing post parameter');
+// Results of /reddit-comments per post id. Popular threads are opened many
+// times in a row, and every uncached lookup costs several Reddit API calls.
+const COMMENTS_CACHE_TTL_MS = parseInt(process.env.COMMENTS_CACHE_TTL_MIN || '15', 10) * 60 * 1000;
+const COMMENTS_ERROR_TTL_MS = 5 * 60 * 1000;
+const COMMENTS_CACHE_MAX = 2000;
+// Each call returns up to ~100 comments; the frontend only asks for threads
+// with up to 2000 comments, so this is plenty and bounds the cost of a request.
+const MAX_REDDIT_CALLS_PER_POST = 30;
+
+const commentsCache = new Map(); // postId -> { expires, status, body }
+const commentsInFlight = new Map(); // postId -> Promise<{ status, body }>
+
+function cacheComments(postId, result, ttl) {
+    commentsCache.delete(postId);
+    commentsCache.set(postId, { ...result, expires: Date.now() + ttl });
+    // Map keeps insertion order, so the first key is the oldest entry
+    while (commentsCache.size > COMMENTS_CACHE_MAX) {
+        commentsCache.delete(commentsCache.keys().next().value);
     }
-    let postId = postParam;
-    const match = postParam.match(/comments\/([a-zA-Z0-9_]+)/);
-    if (match) postId = match[1];
-    let clientDisconnected = false;
-    res.on('close', () => {
-        clientDisconnected = true;
-    });
+}
+
+async function lookupComments(postId) {
     try {
         const authHeader = await auth.getAuth();
-        // Use the recursive fetch function with disconnect check
-        const allComments = await fetchAllRedditComments(postId, authHeader, () => clientDisconnected);
-        if (clientDisconnected) return; // Don't send response if disconnected
-        // Only return IDs
-        const ids = allComments.map(c => c.data?.id).filter(Boolean);
-        res.json({ ids });
+        const allComments = await fetchAllRedditComments(postId, authHeader);
+        const result = { status: 200, body: { ids: allComments.map(c => c.data?.id).filter(Boolean) } };
+        cacheComments(postId, result, COMMENTS_CACHE_TTL_MS);
+        return result;
     } catch (error) {
-        if (clientDisconnected) return;
-        if (error.status === 429) {
-            return res.status(429).send(error.message);
+        const status = error.status || error.response?.status;
+        if (status === 429) {
+            // Not cached: the limit resets within minutes
+            return { status: 429, body: error.message };
         }
-        console.error('Error fetching Reddit comments:', error.message, " url: ", error.config?.url);
-        console.error(error)
-        res.status(500).send('Failed to fetch comments');
+        if (status === 413 || status === 403 || status === 404) {
+            // Too big, private/quarantined or missing: asking again soon won't help
+            const result = { status, body: status === 413 ? error.message : 'Post not available on Reddit' };
+            cacheComments(postId, result, COMMENTS_ERROR_TTL_MS);
+            return result;
+        }
+        console.error('Error fetching Reddit comments:', error.message, 'url:', error.config?.url);
+        return { status: 500, body: 'Failed to fetch comments' };
     }
+}
+
+// Get the ids of all comments that are still visible on Reddit for a post
+app.get('/reddit-comments', async (req, res) => {
+    const postParam = String(req.query.post || '');
+    const match = postParam.match(/comments\/([a-zA-Z0-9]+)/);
+    const postId = (match ? match[1] : postParam).toLowerCase();
+    if (!/^[a-z0-9]{1,16}$/.test(postId)) {
+        return res.status(400).send('Missing or invalid post parameter');
+    }
+
+    const cached = commentsCache.get(postId);
+    if (cached && cached.expires > Date.now()) {
+        res.set('X-Cache', 'HIT');
+        return res.status(cached.status).send(cached.body);
+    }
+
+    // Concurrent requests for the same post share one lookup. The lookup is
+    // not cancelled when a client disconnects: the result is cached, so the
+    // next viewer (or a retry after the frontend timeout) gets it instantly.
+    let pending = commentsInFlight.get(postId);
+    if (!pending) {
+        pending = lookupComments(postId).finally(() => commentsInFlight.delete(postId));
+        commentsInFlight.set(postId, pending);
+    }
+    const result = await pending;
+    if (res.writableEnded || res.destroyed) return;
+    res.set('X-Cache', 'MISS');
+    res.status(result.status).send(result.body);
 });
 
 // Helper to recursively fetch all comments including 'more' children
-async function fetchAllRedditComments(postId, authHeader, isDisconnected) {
+async function fetchAllRedditComments(postId, authHeader) {
     const link_id = `t3_${postId}`;
+    let calls = 0;
+    const fetchCounted = async (url) => {
+        if (++calls > MAX_REDDIT_CALLS_PER_POST) {
+            const err = new Error('Too many comments in this post');
+            err.status = 413;
+            throw err;
+        }
+        console.log('Requesting URL:', url);
+        return fetchRedditComments(url, authHeader);
+    };
     // Fetch initial comment tree
-    const url = `https://oauth.reddit.com/comments/${postId}`;
-    if (isDisconnected && isDisconnected()) return [];
-    console.log('Requesting URL:', url);
-    const data = await fetchRedditComments(url, authHeader);
-    if (isDisconnected && isDisconnected()) return [];
+    const data = await fetchCounted(`https://oauth.reddit.com/comments/${postId}`);
     const commentsTree = data[1]?.data?.children || [];
     // Store all comments by id
     const allComments = {};
@@ -193,29 +241,22 @@ async function fetchAllRedditComments(postId, authHeader, isDisconnected) {
     }
     let moreIds = [];
     collectComments(commentsTree, moreIds);
-    // Recursively fetch 'more' comments
+    // Fetch 'more' comments, 100 ids per request (Reddit API maximum)
     while (moreIds.length > 0) {
-        if (isDisconnected && isDisconnected()) return Object.values(allComments);
-        const childrenParam = moreIds.splice(0, 100).join(','); // Reddit API max 100 ids per request
-        const moreUrl = `https://oauth.reddit.com/api/morechildren?link_id=${link_id}&children=${childrenParam}&api_type=json`;
-        console.log('Requesting URL:', moreUrl);
-        const moreData = await fetchRedditComments(moreUrl, authHeader);
-        if (isDisconnected && isDisconnected()) return Object.values(allComments);
+        const childrenParam = moreIds.splice(0, 100).join(',');
+        const moreData = await fetchCounted(`https://oauth.reddit.com/api/morechildren?link_id=${link_id}&children=${childrenParam}&api_type=json`);
         const things = moreData?.json?.data?.things || [];
-        let newMoreIds = [];
         for (const t of things) {
             if (t.kind === 't1' && t.data && t.data.id) {
                 allComments[t.data.id] = t;
                 // Check for replies in the newly fetched comments
                 if (t.data.replies && t.data.replies.data && t.data.replies.data.children) {
-                    collectComments(t.data.replies.data.children, newMoreIds);
+                    collectComments(t.data.replies.data.children, moreIds);
                 }
             } else if (t.kind === 'more' && t.data && Array.isArray(t.data.children)) {
-                newMoreIds.push(...t.data.children);
+                moreIds.push(...t.data.children);
             }
         }
-        // Add any new 'more' ids to the queue
-        moreIds.push(...newMoreIds);
     }
     // Return all comments as an array
     return Object.values(allComments);
