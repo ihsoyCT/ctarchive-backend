@@ -7,7 +7,10 @@ const port = 3030;
 const auth = require('./auth'); // Import the auth module
 const crypto = require('crypto');
 
-app.set('trust proxy', true);
+// nginx (with real_ip for Cloudflare) is the only trusted proxy; it appends the
+// real client address as the last X-Forwarded-For entry. Trusting every hop
+// would let clients choose their own IP by sending X-Forwarded-For.
+app.set('trust proxy', 'loopback');
 app.use(cors({ origin: [ 'https://ihsoyct.github.io', 'http://localhost:8080', 'http://127.0.0.1:8080' ] }));
 app.disable('x-powered-by');
 
@@ -64,24 +67,30 @@ async function fetchRedditComments(url, axiosConfig) {
     return response.data;
 }
 
+// Decoded values end up in line-based log files; strip control characters
+// so a request cannot inject extra (forged) log lines.
+function cleanLogValue(value) {
+    return value.replace(/[\x00-\x1f\x7f]/g, '').substring(0, 500);
+}
+
 // Middleware to parse the referer data and the 'r' parameter
 app.use((req, res, next) => {
     if (req.query.d) {
         try {
-            req.refererData = Buffer.from(req.query.d, 'base64').toString('utf8').substring(0, 500);
+            req.refererData = cleanLogValue(Buffer.from(String(req.query.d), 'base64').toString('utf8'));
         } catch (err) {
             // If it's not base64, just take the first 500 characters
-            req.refererData = req.query.d.substring(0, 500);
+            req.refererData = cleanLogValue(String(req.query.d));
         }
     }
 
     // Decode the 'r' parameter if it exists
     if (req.query.r) {
         try {
-            req.refererR = Buffer.from(req.query.r, 'base64').toString('utf8').substring(0, 500);
+            req.refererR = cleanLogValue(Buffer.from(String(req.query.r), 'base64').toString('utf8'));
         } catch (err) {
             // If it's not base64, just take the first 500 characters
-            req.refererR = req.query.r.substring(0, 500);
+            req.refererR = cleanLogValue(String(req.query.r));
         }
     } else {
         req.refererR = '';
@@ -92,7 +101,7 @@ app.use((req, res, next) => {
 
 // API endpoint
 app.get('/api', (req, res) => {
-    const logDir = '/var/log/ihsoyct-ref';
+    const logDir = process.env.LOG_DIR || '/var/log/ihsoyct-ref';
     const logFile = path.join(logDir, `${new Date().toISOString().slice(0, 10)}.log`);
 
     const anonIp = crypto.createHash('sha256').update(req.ip).digest('hex');
@@ -121,7 +130,7 @@ app.get('/api', (req, res) => {
     });
 });
 
-app.listen(port, () => {
+app.listen(port, '127.0.0.1', () => {
     console.log(`Server running at http://localhost:${port}`);
 });
 
