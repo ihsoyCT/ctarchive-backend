@@ -208,6 +208,82 @@ app.get('/reddit-comments', async (req, res) => {
     res.status(result.status).send(result.body);
 });
 
+// Current state of individual comments on Reddit, via /api/info. Unlike the
+// comment tree, /api/info also returns comments that were deleted or removed
+// without replies, and their body tells deleted by the author from removed.
+const STATUS_CACHE_MAX = 100000;
+const MAX_STATUS_IDS = 2000; // the frontend only checks threads up to 2000 comments
+const statusCache = new Map(); // comment id -> { status, expires }
+
+function commentStatus(data) {
+    const body = (data.body || '').trim();
+    if (body === '[deleted]') return 'deleted';
+    if (body === '[removed]') return 'removed';
+    if (/^\[\s*removed by reddit\s*\]$/i.test(body)) return 'removed_by_reddit';
+    if (data.author === '[deleted]') return 'account_deleted';
+    return 'ok';
+}
+
+function cacheStatus(id, status) {
+    statusCache.delete(id);
+    statusCache.set(id, { status, expires: Date.now() + COMMENTS_CACHE_TTL_MS });
+    while (statusCache.size > STATUS_CACHE_MAX) {
+        statusCache.delete(statusCache.keys().next().value);
+    }
+}
+
+// Body: comma separated comment ids. Sent as text/plain so the browser does
+// not need a CORS preflight request.
+app.post('/reddit-comments/status', express.text({ limit: '64kb' }), async (req, res) => {
+    const ids = [...new Set(String(req.body || '').split(',').map(id => id.trim().toLowerCase()).filter(Boolean))];
+    if (ids.length === 0 || ids.length > MAX_STATUS_IDS || !ids.every(id => /^[a-z0-9]{1,16}$/.test(id))) {
+        return res.status(400).send(`Expected 1-${MAX_STATUS_IDS} comma separated comment ids`);
+    }
+
+    const statuses = {};
+    const missing = [];
+    for (const id of ids) {
+        const cached = statusCache.get(id);
+        if (cached && cached.expires > Date.now()) statuses[id] = cached.status;
+        else missing.push(id);
+    }
+
+    let failure = null; // 429 or 500 if some ids could not be checked
+    try {
+        const authHeader = missing.length ? await auth.getAuth() : null;
+        for (let i = 0; i < missing.length; i += 100) {
+            const batch = missing.slice(i, i + 100);
+            const url = `https://oauth.reddit.com/api/info?id=${batch.map(id => 't1_' + id).join(',')}`;
+            const data = await fetchRedditComments(url, authHeader);
+            const found = new Set();
+            for (const child of data?.data?.children || []) {
+                if (child.kind !== 't1' || !child.data?.id) continue;
+                found.add(child.data.id);
+                statuses[child.data.id] = commentStatus(child.data);
+                cacheStatus(child.data.id, statuses[child.data.id]);
+            }
+            // Ids Reddit does not know at all (e.g. never existed there)
+            for (const id of batch) {
+                if (!found.has(id)) {
+                    statuses[id] = 'unknown';
+                    cacheStatus(id, 'unknown');
+                }
+            }
+        }
+    } catch (error) {
+        // Return what we have; the frontend marks the rest as not checked
+        failure = error.status === 429 ? 429 : 500;
+        if (failure === 500) {
+            console.error('Error fetching comment status:', error.message, 'url:', error.config?.url?.slice(0, 100));
+        }
+    }
+
+    if (failure && Object.keys(statuses).length === 0) {
+        return res.status(failure).send(failure === 429 ? 'Reddit rate limit reached, try again later' : 'Failed to fetch comment status');
+    }
+    res.json({ statuses, incomplete: failure !== null });
+});
+
 // Helper to recursively fetch all comments including 'more' children
 async function fetchAllRedditComments(postId, authHeader) {
     const link_id = `t3_${postId}`;
