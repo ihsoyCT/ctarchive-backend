@@ -6,6 +6,7 @@ const cors = require('cors');
 const port = 3030;
 const auth = require('./auth'); // Import the auth module
 const crypto = require('crypto');
+const { detectBot } = require('./bots');
 
 // nginx (with real_ip for Cloudflare) is the only trusted proxy; it appends the
 // real client address as the last X-Forwarded-For entry. Trusting every hop
@@ -118,7 +119,11 @@ app.get('/api', (req, res) => {
     }
     let refererString = "";
     if(req.refererR !== '') refererString = ` - Referer: ${req.refererR}`;
-    const logEntry = `[REQUEST] - [${new Date().toISOString()}] - ${anonIp} - ${req.refererData}${refererString}\n`;
+    // Crawlers get their own line type so the stats can count them separately
+    const bot = detectBot(req.get('user-agent'));
+    const logEntry = bot
+        ? `[BOT] - [${new Date().toISOString()}] - ${anonIp} - ${req.refererData.replace(/\s/g, '%20')} - ${bot}\n`
+        : `[REQUEST] - [${new Date().toISOString()}] - ${anonIp} - ${req.refererData}${refererString}\n`;
 
     // Append the log entry to the file
     fs.appendFile(logFile, logEntry, (err) => {
@@ -132,6 +137,15 @@ app.get('/api', (req, res) => {
 
 app.listen(port, '127.0.0.1', () => {
     console.log(`Server running at http://localhost:${port}`);
+});
+
+// Crawlers render the site too, but the deleted-comment check is only useful
+// to people and each lookup costs Reddit API calls.
+app.use('/reddit-comments', (req, res, next) => {
+    if (detectBot(req.get('user-agent'))) {
+        return res.status(403).send('Not available for crawlers');
+    }
+    next();
 });
 
 // Results of /reddit-comments per post id. Popular threads are opened many
