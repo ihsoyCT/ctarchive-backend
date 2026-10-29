@@ -139,11 +139,33 @@ app.listen(port, '127.0.0.1', () => {
     console.log(`Server running at http://localhost:${port}`);
 });
 
+// When Reddit rejects the server itself (IP block page or a refused token),
+// every lookup fails the same way. Stop asking for a while instead of
+// sending each visitor's request to Reddit and answering with 500.
+const REDDIT_PAUSE_MS = 30 * 60 * 1000;
+const REDDIT_UNAVAILABLE = 'The deleted-comment check is unavailable right now: Reddit is refusing requests from this server';
+let redditPausedUntil = 0;
+
+function noteRedditRejection(error) {
+    const status = error.response?.status;
+    const fromReddit = /reddit\.com/.test(error.config?.url || '');
+    const blockPage = status === 403 && typeof error.response?.data === 'string' && /blocked by network security/i.test(error.response.data);
+    if (!fromReddit || !(status === 401 || blockPage)) return false;
+    if (Date.now() >= redditPausedUntil) {
+        console.error(`Reddit rejected the server (${status}${blockPage ? ', network block' : ''}), pausing lookups for ${REDDIT_PAUSE_MS / 60000} min`);
+    }
+    redditPausedUntil = Date.now() + REDDIT_PAUSE_MS;
+    return true;
+}
+
 // Crawlers render the site too, but the deleted-comment check is only useful
 // to people and each lookup costs Reddit API calls.
 app.use('/reddit-comments', (req, res, next) => {
     if (detectBot(req.get('user-agent'))) {
         return res.status(403).send('Not available for crawlers');
+    }
+    if (Date.now() < redditPausedUntil) {
+        return res.status(503).send(REDDIT_UNAVAILABLE);
     }
     next();
 });
@@ -177,6 +199,7 @@ async function lookupComments(postId) {
         cacheComments(postId, result, COMMENTS_CACHE_TTL_MS);
         return result;
     } catch (error) {
+        if (noteRedditRejection(error)) return { status: 503, body: REDDIT_UNAVAILABLE };
         const status = error.status || error.response?.status;
         if (status === 429) {
             // Not cached: the limit resets within minutes
@@ -286,14 +309,15 @@ app.post('/reddit-comments/status', express.text({ limit: '64kb' }), async (req,
         }
     } catch (error) {
         // Return what we have; the frontend marks the rest as not checked
-        failure = error.status === 429 ? 429 : 500;
+        failure = noteRedditRejection(error) ? 503 : error.status === 429 ? 429 : 500;
         if (failure === 500) {
             console.error('Error fetching comment status:', error.message, 'url:', error.config?.url?.slice(0, 100));
         }
     }
 
     if (failure && Object.keys(statuses).length === 0) {
-        return res.status(failure).send(failure === 429 ? 'Reddit rate limit reached, try again later' : 'Failed to fetch comment status');
+        const message = { 429: 'Reddit rate limit reached, try again later', 503: REDDIT_UNAVAILABLE }[failure] || 'Failed to fetch comment status';
+        return res.status(failure).send(message);
     }
     res.json({ statuses, incomplete: failure !== null });
 });
